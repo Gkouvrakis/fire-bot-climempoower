@@ -1,0 +1,9 @@
+geopandas==0.14.3
+fiona==1.9.5
+rasterio==1.3.9
+pandas>=2.0.0
+pyarrow
+pika
+requests
+numpy<2
+shapely

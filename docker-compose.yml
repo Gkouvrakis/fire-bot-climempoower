@@ -1,0 +1,10 @@
+services:
+  fire-monitoring-bot:
+    build: .
+    container_name: active-fire-bot
+    environment:
+      - FIRE_BOT_DATA_DIR=/app/data
+    volumes:
+      # This links your server's local "data" folder to the container's "data" folder
+      - ./data:/app/data
+    restart: unless-stopped
