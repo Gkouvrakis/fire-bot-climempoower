@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy your script
-COPY ondemand_fire_bot.py .
+COPY daily_fire_bot.py .
 
 # Run the script
-CMD ["python", "-u", "ondemand_fire_bot.py"]
+CMD ["python", "-u", "daily_fire_bot.py"]
