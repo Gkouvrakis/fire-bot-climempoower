@@ -7,3 +7,4 @@ pika
 requests
 numpy<2
 shapely
+pymongo
