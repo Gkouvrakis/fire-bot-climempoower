@@ -4,8 +4,8 @@ services:
     container_name: active-fire-bot
     environment:
       - FIRE_BOT_DATA_DIR=/app/data
-      - MONGO_URI=mongodb://username:password@your-mongodb-host:27017/
-      - MONGO_DB_NAME=fire_monitoring
+      - MONGO_URI=mongodb://ClimAdmin:Cl1m3mp0W3r@160.40.53.31:27017/ClimEmpower
+      - MONGO_DB_NAME=ClimEmpower
       - MONGO_COLLECTION_NAME=detected_fires
     volumes:
       - ./data:/app/data
