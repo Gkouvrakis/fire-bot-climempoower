@@ -12,6 +12,7 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 import json 
+from pymongo import MongoClient
 
 
 # 1. Main Input Folder
@@ -37,7 +38,7 @@ SOURCES = [
 PIXEL_SIZE = 0.001
 # =================================================
 
-print("--- Dynamic Fire Monitor (with API Heartbeat) Initialized ---")
+print("--- Dynamic Fire Monitor (with MongoDB Stream) Initialized ---")
 
 # --- Helper 1: Robust Download ---
 def robust_get_request(url):
@@ -104,7 +105,7 @@ def save_geotiff(gdf, output_path, pixel_size=PIXEL_SIZE):
         print(f"      ! Error creating GeoTIFF: {e}")
         return False
 
-# --- Helper 4: JSON Metadata ---
+# --- Helper 4: JSON Metadata (Local Storage Backup) ---
 def save_fire_json(gdf, area_name, project_name, date_str, output_path):
     try:
         avg_lat = gdf.geometry.y.mean()
@@ -155,146 +156,85 @@ def save_fire_json(gdf, area_name, project_name, date_str, output_path):
         print(f"      ! Error creating JSON: {e}")
         return False
 
-# Post to API
-# Post to API
-def post_fires_to_api(gdf, location_id, target_date, api_url, project_name="Ainature", save_dir=None, base_filename=None):
-    """
-    Packages the metadata into your exact format structure and selectively attaches 
-    produced physical files based on quick True/False switches. Safe and customizable.
-    """
-    # =========================================================================
-    # Change True to False to turn off sending an asset
-    # =========================================================================
-    SEND_METADATA_JSON = True   # Send the raw text JSON metadata packet
-    SEND_CSV_FILE      = False  # Set to True if you want to upload the spreadsheet (.csv)
-    SEND_TIFF_HEATMAP  = False  # Set to True if you want to upload the heatmap image (.tif)
-    SEND_SHAPEFILE_ZIP = False  # Set to True if you want to upload the Vector Map (.zip)
-    # =========================================================================
 
-    if not api_url:
-        print("     [API SKIP] No API endpoint configured for this area.")
+# --- Helper 5: Direct In-Memory MongoDB Uploader ---
+def insert_fires_direct_to_mongodb(gdf, area_name, project_name, date_str):
+    """
+    Constructs the structured fire metadata payload in memory directly from 
+    the GeoDataFrame and inserts it straight into MongoDB without reading from disk.
+    """
+    mongo_uri = os.getenv("MONGO_URI")
+    db_name = os.getenv("MONGO_DB_NAME", "fire_monitoring")
+    coll_name = os.getenv("MONGO_COLLECTION_NAME", "detected_fires")
+
+    if not mongo_uri:
+        print("     [MONGO SKIP] No MONGO_URI environment variable configured.")
         return
 
     try:
-        # 1. Build the baseline Metadata Payload matching your exact format requirements
-        json_date_label = target_date.strftime("%Y-%m-%d")
-        
-        avg_lat = 0.0
-        avg_lon = 0.0
+        avg_lat = gdf.geometry.y.mean()
+        avg_lon = gdf.geometry.x.mean()
+
         fire_list = []
-        
-        if gdf is not None and not gdf.empty:
-            avg_lat = round(float(gdf.geometry.y.mean()), 5)
-            avg_lon = round(float(gdf.geometry.x.mean()), 5)
+        for _, row in gdf.iterrows():
+            raw_time = str(row.get('acq_time', ''))
+            formatted_time = raw_time
+            if len(raw_time) == 4 and raw_time.isdigit():
+                formatted_time = f"{raw_time[:2]}:{raw_time[2:]}"
+            elif len(raw_time) == 3 and raw_time.isdigit():
+                formatted_time = f"0{raw_time[:1]}:{raw_time[1:]}"
 
-            for _, row in gdf.iterrows():
-                raw_time = str(row.get('acq_time', ''))
-                formatted_time = raw_time
-                if len(raw_time) == 4 and raw_time.isdigit():
-                    formatted_time = f"{raw_time[:2]}:{raw_time[2:]}"
-                elif len(raw_time) == 3 and raw_time.isdigit():
-                    formatted_time = f"0{raw_time[:1]}:{raw_time[1:]}"
-                
-                # Helper to format data safely handling numpy/NaN types
-                def clean_val(v, is_float=False):
-                    if pd.isna(v) or v is None:
-                        return None
-                    if isinstance(v, (np.integer, np.floating)):
-                        return float(v) if isinstance(v, np.floating) else int(v)
-                    return float(v) if is_float else v
+            fire_obj = {
+                "latitude": row.get('latitude'),
+                "longitude": row.get('longitude'),
+                "brightness": row.get('brightness'),
+                "acquisition_time": formatted_time,
+                "satellite": row.get('satellite'),
+                "instrument": row.get('instrument'),
+                "confidence": row.get('confidence'),
+                "version": row.get('version'),
+                "brightness_band_t31": row.get('bright_t31'),
+                "fire_radiative_power": row.get('frp'),
+                "source": row.get('source_api')
+            }
+            
+            # Convert NumPy types explicitly to native Python primitives for PyMongo/BSON compatibility
+            for k, v in fire_obj.items():
+                if pd.isna(v) or v is None:
+                    fire_obj[k] = None
+                elif isinstance(v, (np.integer, np.floating)):
+                    fire_obj[k] = float(v) if isinstance(v, np.floating) else int(v)
 
-                fire_obj = {
-                    "latitude": float(row.geometry.y),
-                    "longitude": float(row.geometry.x),
-                    "brightness": clean_val(row.get('brightness'), is_float=True),
-                    "acquisition_time": formatted_time,
-                    "satellite": str(row.get('satellite', 'Unknown')),
-                    "instrument": str(row.get('instrument', 'Unknown')),
-                    "confidence": clean_val(row.get('confidence')),
-                    "version": str(row.get('version', 'Unknown')),
-                    "brightness_band_t31": clean_val(row.get('bright_t31'), is_float=True),
-                    "fire_radiative_power": clean_val(row.get('frp'), is_float=True),
-                    "source": str(row.get('source_api', 'Unknown'))
-                }
-                fire_list.append(fire_obj)
+            fire_list.append(fire_obj)
 
-        payload = {
+        # Assemble document directly inside volatile RAM
+        document = {
             "project": project_name,
-            "location": str(location_id),
-            "latitude": avg_lat,
-            "longitude": avg_lon,
-            "date": json_date_label,
-            "metadata": fire_list
+            "location": area_name,
+            "latitude": round(float(avg_lat), 5) if not pd.isna(avg_lat) else 0.0,
+            "longitude": round(float(avg_lon), 5) if not pd.isna(avg_lon) else 0.0,
+            "date": date_str,
+            "metadata": fire_list,
+            "inserted_at": datetime.utcnow()
         }
 
-        # 2. Setup the Multipart Form Containers
-        api_data = {}
-        api_files = {}
-
-        if SEND_METADATA_JSON:
-            api_data["metadata"] = json.dumps(payload)
-
-        # Helper internal function to cleanly zip shapefile sub-files on the fly
-        def zip_shapefile_components(directory, filename):
-            import zipfile
-            zip_path = directory / f"{filename}.zip"
-            extensions = ['.shp', '.shx', '.dbf', '.prj']
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for ext in extensions:
-                    file_to_add = directory / f"{filename}{ext}"
-                    if file_to_add.exists():
-                        zipf.write(file_to_add, arcname=f"{filename}{ext}")
-            return zip_path
-
-        # 3. Check and attach physical files safely from disk storage
-        opened_files = []
-        
-        if save_dir and base_filename and save_dir.exists():
-            if SEND_CSV_FILE:
-                csv_path = save_dir / f"{base_filename}.csv"
-                if csv_path.exists():
-                    f = open(csv_path, 'rb')
-                    opened_files.append(f)
-                    api_files['csv_file'] = (csv_path.name, f, 'text/csv')
-
-            if SEND_TIFF_HEATMAP:
-                tif_path = save_dir / f"{base_filename}.tif"
-                if tif_path.exists():
-                    f = open(tif_path, 'rb')
-                    opened_files.append(f)
-                    api_files['tiff_heatmap'] = (tif_path.name, f, 'image/tiff')
-
-            if SEND_SHAPEFILE_ZIP:
-                try:
-                    zip_path = zip_shapefile_components(save_dir, base_filename)
-                    f = open(zip_path, 'rb')
-                    opened_files.append(f)
-                    api_files['shapefile_vector'] = (zip_path.name, f, 'application/zip')
-                except Exception as zip_err:
-                    print(f"      ! [API PREP WARNING] Failed zipping shapefile: {zip_err}")
-
-        # 4. Fire the Combined Data Package over the network
-        if not api_files and not api_data:
-            print("     [API SKIP] All payload switches are set to False. Nothing to send.")
-            return
-
-        print(f"     [API SEND] Shipping payload (Files attached: {list(api_files.keys())})...")
-        response = requests.post(api_url, data=api_data, files=api_files, timeout=45)
-        
-        if response.status_code in [200, 201]:
-            print(f"     [API SUCCESS] Synchronized successfully with endpoint!")
-        else:
-            print(f"     [API ERROR] Rejected by server. Code: {response.status_code}. Details: {response.text}")
+        print(f"     [MONGO CONNECT] Connecting to database cluster...")
+        with MongoClient(mongo_uri, serverSelectionTimeoutMS=5000) as client:
+            db = client[db_name]
+            collection = db[coll_name]
+            
+            print(f"     [MONGO WRITE] Injecting record into '{coll_name}'...")
+            result = collection.insert_one(document)
+            
+            if result.acknowledged:
+                print(f"     [MONGO SUCCESS] Inserted successfully! Document ID: {result.inserted_id}")
+            else:
+                print(f"     [MONGO ERROR] Insertion write unacknowledged by host.")
 
     except Exception as e:
-        print(f"     [API FAILED] Network streaming failure occurred: {e}")
-        
-    finally:
-        for f in opened_files:
-            f.close()
-        if 'zip_path' in locals() and zip_path.exists():
-            try: os.remove(zip_path)
-            except: pass
+        print(f"     [MONGO FAILED] Failed to stream data directly to database: {e}")
+
+
 # ================= JOB FUNCTION  =================
 def scan_specific_area(folder_name, project_name, location_id, api_endpoint):
     """
@@ -359,20 +299,19 @@ def scan_specific_area(folder_name, project_name, location_id, api_endpoint):
                 clean_gdf[cols].to_file(save_dir / f"{base_filename}.shp")
                 pd.DataFrame(clean_gdf[cols].drop(columns='geometry')).to_csv(save_dir / f"{base_filename}.csv", index=False)
                 save_geotiff(clean_gdf, save_dir / f"{base_filename}.tif")
+                
+                # 1. CREATE THE LOCAL JSON FILE (Maintained for your backup)
                 save_fire_json(clean_gdf, area_sub_name, project_name, json_date_label, save_dir / "metadata.json")
                 
-                print(f"     Saved local report to: {save_dir}")
+                print(f"     Saved local spatial vector, raster, and metadata reports to: {save_dir}")
 
-                # ONLY SEND TO API IF WE HAVE ACTUAL FIRES
-                post_fires_to_api(
-                                        gdf=clean_gdf, 
-                                        location_id=location_id, 
-                                        target_date=yesterday, 
-                                        api_url=api_endpoint,
-                                        project_name=project_name,
-                                        save_dir=save_dir,          # Gives the function access to the output folder
-                                        base_filename=base_filename # Gives the function access to the file names
-                                    )
+                # 2. STREAM DIRECTLY TO MONGODB (In-memory network process)
+                insert_fires_direct_to_mongodb(
+                    gdf=clean_gdf,
+                    area_name=area_sub_name,
+                    project_name=project_name,
+                    date_str=json_date_label
+                )
 
             # --- SCENARIO 3: Fires nearby, but outside your polygon ---
             else:
